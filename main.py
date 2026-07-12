@@ -14,7 +14,7 @@ load_dotenv()
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv(
     "OPENROUTER_MODEL",
-    "google/gemma-4-26b-a4b-it:free"
+    "openai/gpt-oss-120b:free"
 )
 
 app = FastAPI()
@@ -74,40 +74,82 @@ def normalize_number(value):
 
 
 SYSTEM_PROMPT = """
-You are an invoice extraction engine.
+You are a deterministic invoice information extraction engine.
 
-Extract ONLY these fields.
+Your task is to extract information exactly as written.
 
-Return STRICT JSON.
+Return ONLY valid JSON.
 
-No markdown.
+Do NOT use markdown.
 
-No explanation.
+Do NOT wrap JSON inside ```.
 
-Schema:
+Never explain.
+
+Never summarize.
+
+Never invent values.
+
+Return this exact schema:
 
 {
-"invoice_no": string|null,
-"date": string|null,
-"vendor": string|null,
-"amount": number|null,
-"tax": number|null,
-"currency": string|null
+"invoice_no": null,
+"date": null,
+"vendor": null,
+"amount": null,
+"tax": null,
+"currency": null
 }
 
 Rules:
 
-amount = subtotal BEFORE tax
+invoice_no:
+- Extract the primary invoice identifier.
+- It may be labelled:
+  Invoice No
+  Invoice Number
+  Invoice #
+  Inv No
+  Bill No
+  Reference No
+  Document Number
+- It may also appear WITHOUT any label.
+- Examples:
+  INV-2026-0041
+  IR-2001
+  DELTA-112
+  A-445
+  INV/2025/19
 
-tax = tax amount only
+Do NOT confuse invoice numbers with:
+GSTIN
+PAN
+Order Number
+Purchase Order
+Customer ID
+Phone numbers
 
-date = YYYY-MM-DD
+date:
+Return YYYY-MM-DD.
 
-Always output every key.
+amount:
+Subtotal BEFORE tax.
 
-If missing use null.
+tax:
+Tax amount only.
+
+currency:
+ISO code when possible.
+Otherwise:
+INR
+USD
+EUR
+GBP
+
+Return every key.
+
+Missing values must be null.
 """
-
 
 async def extract_llm(invoice_text):
 
@@ -124,6 +166,7 @@ async def extract_llm(invoice_text):
             },
         ],
         "temperature": 0,
+        "top_p": 0.1,
         "response_format": {
             "type": "json_object"
         },
@@ -136,6 +179,8 @@ async def extract_llm(invoice_text):
             headers={
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json",
+                "HTTP-Referer": "https://invoice-extractor-iitm-tds.onrender.com",
+                "X-Title": "Invoice Extractor IITM",
             },
             json=payload,
         )
@@ -145,6 +190,10 @@ async def extract_llm(invoice_text):
     data = r.json()
 
     text = data["choices"][0]["message"]["content"]
+
+    text = text.replace("```json", "")
+    text = text.replace("```", "")
+    text = text.strip()
 
     obj = json.loads(text)
 
