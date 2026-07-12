@@ -1,153 +1,179 @@
+import json
+import os
+
+from dateutil import parser
+from dotenv import load_dotenv
+import httpx
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dateutil import parser
-import re
 
-app = FastAPI(title="Invoice Extractor")
+load_dotenv()
+
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "google/gemma-4-26b-a4b-it:free"
+)
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 @app.get("/")
-def root():
-    return {"status": "ok"}
+def home():
+    return {"status": "running"}
 
 
-class Invoice(BaseModel):
+class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-def parse_amount(value):
+def normalize_date(date_str):
+
+    if date_str is None:
+        return None
+
+    try:
+        return parser.parse(date_str).strftime("%Y-%m-%d")
+    except:
+        return None
+
+
+def normalize_number(value):
+
     if value is None:
         return None
-    value = value.replace(",", "").replace(" ", "")
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    value = (
+        str(value)
+        .replace(",", "")
+        .replace("₹", "")
+        .replace("Rs.", "")
+        .replace("Rs", "")
+        .replace("INR", "")
+        .replace("$", "")
+        .replace("USD", "")
+        .strip()
+    )
+
     try:
         return float(value)
     except:
         return None
 
 
-def search_patterns(text, patterns):
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            return m
-    return None
+SYSTEM_PROMPT = """
+You are an invoice extraction engine.
+
+Extract ONLY these fields.
+
+Return STRICT JSON.
+
+No markdown.
+
+No explanation.
+
+Schema:
+
+{
+"invoice_no": string|null,
+"date": string|null,
+"vendor": string|null,
+"amount": number|null,
+"tax": number|null,
+"currency": string|null
+}
+
+Rules:
+
+amount = subtotal BEFORE tax
+
+tax = tax amount only
+
+date = YYYY-MM-DD
+
+Always output every key.
+
+If missing use null.
+"""
+
+
+async def extract_llm(invoice_text):
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": invoice_text,
+            },
+        ],
+        "temperature": 0,
+        "response_format": {
+            "type": "json_object"
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    r.raise_for_status()
+
+    data = r.json()
+
+    text = data["choices"][0]["message"]["content"]
+
+    obj = json.loads(text)
+
+    result = {
+        "invoice_no": obj.get("invoice_no"),
+        "date": normalize_date(obj.get("date")),
+        "vendor": obj.get("vendor"),
+        "amount": normalize_number(obj.get("amount")),
+        "tax": normalize_number(obj.get("tax")),
+        "currency": obj.get("currency"),
+    }
+
+    return result
 
 
 @app.post("/extract")
-def extract(data: Invoice):
+async def extract(req: InvoiceRequest):
 
-    text = data.invoice_text
+    try:
 
-    result = {
-        "invoice_no": None,
-        "date": None,
-        "vendor": None,
-        "amount": None,
-        "tax": None,
-        "currency": None,
-    }
+        return await extract_llm(req.invoice_text)
 
-    # -------------------------
-    # Invoice Number
-    # -------------------------
-    invoice_patterns = [
-        r"Invoice\s*(?:No|Number|#|ID)?\s*[:#-]?\s*([A-Za-z0-9\-\/]+)",
-        r"Inv\s*No\.?\s*[:#-]?\s*([A-Za-z0-9\-\/]+)",
-        r"Invoice#\s*([A-Za-z0-9\-\/]+)",
-    ]
+    except Exception:
 
-    m = search_patterns(text, invoice_patterns)
-    if m:
-        result["invoice_no"] = m.group(1).strip()
-
-    # -------------------------
-    # Vendor
-    # -------------------------
-    vendor_patterns = [
-        r"Vendor\s*:\s*(.+)",
-        r"Seller\s*:\s*(.+)",
-        r"Supplier\s*:\s*(.+)",
-        r"From\s*:\s*(.+)",
-    ]
-
-    m = search_patterns(text, vendor_patterns)
-    if m:
-        result["vendor"] = m.group(1).strip()
-
-    # -------------------------
-    # Date
-    # -------------------------
-    m = re.search(r"Date\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
-    if m:
-        try:
-            result["date"] = parser.parse(
-                m.group(1).strip(), dayfirst=True
-            ).strftime("%Y-%m-%d")
-        except:
-            pass
-
-    # -------------------------
-    # Currency
-    # -------------------------
-    if re.search(r"\bINR\b|₹|Rs\.?", text, re.I):
-        result["currency"] = "INR"
-    elif re.search(r"\bUSD\b|\$", text):
-        result["currency"] = "USD"
-    elif re.search(r"\bEUR\b|€", text):
-        result["currency"] = "EUR"
-
-    money = r"(?:Rs\.?|₹|INR|USD|\$|EUR|€)?\s*([\d,]+(?:\.\d+)?)"
-
-    # -------------------------
-    # Amount (Subtotal BEFORE tax)
-    # -------------------------
-    amount_patterns = [
-        rf"Sub\s*Total\s*:?\s*{money}",
-        rf"Subtotal\s*:?\s*{money}",
-        rf"Amount\s*Before\s*Tax\s*:?\s*{money}",
-        rf"Net\s*Amount\s*:?\s*{money}",
-        rf"Taxable\s*Amount\s*:?\s*{money}",
-        rf"Before\s*Tax\s*:?\s*{money}",
-    ]
-
-    for pattern in amount_patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            result["amount"] = parse_amount(m.group(1))
-            break
-
-    # -------------------------
-    # Tax
-    # -------------------------
-    tax_patterns = [
-        rf"GST(?:\s*\(\d+%?\))?\s*:?\s*{money}",
-        rf"VAT(?:\s*\(\d+%?\))?\s*:?\s*{money}",
-        rf"CGST\s*:?\s*{money}",
-        rf"SGST\s*:?\s*{money}",
-        rf"IGST\s*:?\s*{money}",
-        rf"Tax\s*:?\s*{money}",
-    ]
-
-    total_tax = 0.0
-    found_tax = False
-
-    for pattern in tax_patterns:
-        for m in re.finditer(pattern, text, re.I):
-            value = parse_amount(m.group(1))
-            if value is not None:
-                total_tax += value
-                found_tax = True
-
-    if found_tax:
-        result["tax"] = round(total_tax, 2)
-
-    return result
+        return {
+            "invoice_no": None,
+            "date": None,
+            "vendor": None,
+            "amount": None,
+            "tax": None,
+            "currency": None,
+        }
